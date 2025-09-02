@@ -5,19 +5,18 @@ package snowflake
 
 import (
 	"context"
-	"crypto/rsa"
-	"crypto/x509"
 	"database/sql"
-	"encoding/pem"
+	"encoding/base64"
 	"fmt"
-	"github.com/hashicorp/errwrap"
-	log "github.com/hashicorp/go-hclog"
-	"github.com/hashicorp/go-secure-stdlib/parseutil"
-	"github.com/hashicorp/vault/sdk/database/helper/dbutil"
 	"net/url"
 	"regexp"
 	"sync"
 	"time"
+
+	"github.com/hashicorp/errwrap"
+	log "github.com/hashicorp/go-hclog"
+	"github.com/hashicorp/go-secure-stdlib/parseutil"
+	"github.com/hashicorp/vault/sdk/database/helper/dbutil"
 
 	"github.com/hashicorp/vault/sdk/database/helper/connutil"
 	"github.com/mitchellh/mapstructure"
@@ -105,6 +104,22 @@ func (c *snowflakeConnectionProducer) Init(ctx context.Context, initConfig map[s
 		})
 	}
 
+	if len(c.PrivateKey) > 0 {
+
+		username := c.Username
+		privateKey := c.PrivateKey
+
+		if !c.DisableEscaping {
+			username = url.PathEscape(c.Username)
+		}
+
+		// Replace templated username and privateKey in connection URL with actual values
+		c.ConnectionURL = dbutil.QueryHelper(c.ConnectionURL, map[string]string{
+			"username":   username,
+			"privateKey": base64.StdEncoding.EncodeToString(privateKey),
+		})
+	}
+
 	if c.MaxOpenConnections == 0 {
 		c.MaxOpenConnections = 4
 	}
@@ -156,7 +171,7 @@ func (c *snowflakeConnectionProducer) Connection(ctx context.Context) (interface
 	var db *sql.DB
 	var err error
 	if len(c.PrivateKey) > 0 {
-		db, err = openSnowflake(c.ConnectionURL, c.Username, c.PrivateKey)
+		db, err = openSnowflake(c.ConnectionURL)
 		if err != nil {
 			return nil, fmt.Errorf("error opening Snowflake connection using key-pair auth: %w", err)
 		}
@@ -196,68 +211,16 @@ func (c *snowflakeConnectionProducer) Close() error {
 }
 
 // Open the DB connection to Snowflake or return an error.
-func openSnowflake(connectionURL, username string, providedPrivateKey []byte) (*sql.DB, error) {
-	// Parse the connection_url for required fields. Should be of
-	// the form <account_name>.snowflakecomputing.com/<db_name>
-	accountName, dbName, err := parseSnowflakeFieldsFromURL(connectionURL)
+func openSnowflake(connectionURL string) (*sql.DB, error) {
+
+	// Parse the connection_url - should be of the form
+	// {username}@<account_name>.snowflakecomputing.com?authenticator=SNOWFLAKE_JWT&privateKey={private_key}
+	snowflakeConfig, err := gosnowflake.ParseDSN(connectionURL)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to parse connection_url: %w", err)
 	}
 
-	privateKey, err := getPrivateKey(providedPrivateKey)
-	if err != nil {
-		return nil, err
-	}
-
-	snowflakeConfig := &gosnowflake.Config{
-		Account:       accountName,
-		Database:      dbName,
-		User:          username,
-		Authenticator: gosnowflake.AuthTypeJwt,
-		PrivateKey:    privateKey,
-	}
 	connector := gosnowflake.NewConnector(gosnowflake.SnowflakeDriver{}, *snowflakeConfig)
 
 	return sql.OpenDB(connector), nil
-}
-
-// parseSnowflakeFieldsFromURL uses a regex to extract account and DB
-// info from a connectionURL
-func parseSnowflakeFieldsFromURL(connectionURL string) (string, string, error) {
-	if !accountAndDBNameFromConnURLRegex.MatchString(connectionURL) {
-		return "", "", ErrInvalidSnowflakeURL
-	}
-	res := accountAndDBNameFromConnURLRegex.FindStringSubmatch(connectionURL)
-	if len(res) != 3 {
-		return "", "", ErrInvalidSnowflakeURL
-	}
-
-	return res[1], res[2], nil
-}
-
-// Open and decode the private key file
-func getPrivateKey(providedPrivateKey []byte) (*rsa.PrivateKey, error) {
-	block, _ := pem.Decode(providedPrivateKey)
-	if block == nil {
-		return nil, ErrInvalidPrivateKey
-	}
-
-	// key-type supplied in this part of the workflow has to be private.
-	// Public keys are set up directly on the server side in Snowflake.
-	// https://docs.snowflake.com/en/user-guide/key-pair-auth#assign-the-public-key-to-a-snowflake-user
-	if block.Type != "PRIVATE KEY" {
-		return nil, fmt.Errorf("unexpected private key type, expected type 'PRIVATE KEY', got '%s'", block.Type)
-	}
-
-	key, err := x509.ParsePKCS8PrivateKey(block.Bytes)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse private key to PKCS8: %w", err)
-	}
-
-	privateKey, ok := key.(*rsa.PrivateKey)
-	if !ok {
-		return nil, fmt.Errorf("private key was parsed into an unexpected type")
-	}
-
-	return privateKey, nil
 }
